@@ -14,6 +14,9 @@ source venv/bin/activate
 # Install dependencies
 pip install -r requirements.txt
 
+# Optional: copy the configuration template and edit it as needed
+cp .env.example .env
+
 # Start backend server (runs at http://localhost:9000)
 uvicorn app.main:app --reload --port 9000
 ```
@@ -25,7 +28,7 @@ Interactive API documentation will be available at `http://localhost:9000/docs`.
 ## 2. Link from Frontend
 
 ### Step 1: Configure CORS
-By default, the backend accepts requests from `http://localhost:3000`. If your frontend runs on a different port (e.g., Vite on `http://localhost:5173`), set `FRONTEND_ORIGIN` in `.env`:
+By default, the backend accepts requests from `http://localhost:3000`. If your frontend runs on a different port (e.g., Vite on `http://localhost:5173`), set `FRONTEND_ORIGIN` in `.env` (comma-separated origins are supported):
 
 ```env
 FRONTEND_ORIGIN=http://localhost:3000,http://localhost:5173
