@@ -28,5 +28,8 @@ The backend stores active scan jobs and results in memory. Restarting the backen
 Only scan websites you own or have explicit permission to test. The backend blocks local and other restricted network destinations as a safety measure.
 
 ## Demo
-[web_sentinal.webm](https://github.com/user-attachments/assets/cd1682ec-4111-4423-868c-4d6676c76ce5)
+https://github.com/user-attachments/assets/441acf8c-4747-437c-9e0a-1b91787c52ea
+
+
+
 
