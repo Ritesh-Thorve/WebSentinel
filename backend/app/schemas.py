@@ -47,10 +47,23 @@ class ScanSummary(BaseModel):
 
 
 class ScanResponse(BaseModel):
+    scan_id: str | None = Field(default=None, description="Identifier used to query or stop this scan")
     target_url: str = Field(..., description="Scanned target address")
-    status: str = Field(default="completed", description="Scan execution state")
+    status: Literal["running", "completed", "cancelled", "failed"] = Field(
+        default="completed",
+        description="Scan execution state",
+    )
     findings: list[Finding] = Field(default_factory=list, description="Discovered security findings")
     summary: ScanSummary = Field(default_factory=ScanSummary, description="Aggregated severity metrics")
+    scanned_urls: list[str] = Field(
+        default_factory=list,
+        description="Same-origin URLs crawled during the scan, without query strings",
+    )
+    scan_limit_reached: bool = Field(
+        default=False,
+        description="Whether the crawl stopped while same-origin URLs remained in its queue",
+    )
+    error: str | None = Field(default=None, description="Failure details when the scan fails")
 
 
 class HealthResponse(BaseModel):

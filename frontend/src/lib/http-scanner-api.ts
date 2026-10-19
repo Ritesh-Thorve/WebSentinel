@@ -7,6 +7,32 @@ const severityDto = z.enum(['critical', 'high', 'medium', 'low', 'info']);
 const statusDto = z.enum(['pending', 'running', 'completed', 'failed', 'cancelled']);
 const isoDate = z.string().refine(v => !Number.isNaN(Date.parse(v)), 'Invalid timestamp');
 const summaryDto = z.object({ critical: z.number().int().nonnegative(), high: z.number().int().nonnegative(), medium: z.number().int().nonnegative(), low: z.number().int().nonnegative(), info: z.number().int().nonnegative() });
+const synchronousFindingDto = z.object({
+  title: z.string(),
+  severity: z.enum(['critical', 'high', 'medium', 'low', 'informational']),
+  affected_url: z.string(),
+  description: z.string(),
+  evidence: z.string(),
+  recommendation: z.string(),
+  confidence: z.enum(['high', 'medium', 'low']),
+});
+const synchronousScanDto = z.object({
+  target_url: z.string().url(),
+  scan_id: z.string().min(1).nullable().optional(),
+  status: z.enum(['running', 'completed', 'cancelled', 'failed']),
+  error: z.string().nullable().optional(),
+  findings: z.array(synchronousFindingDto),
+  scanned_urls: z.array(z.string().url()).max(500).optional(),
+  scan_limit_reached: z.boolean().optional(),
+  summary: z.object({
+    total_findings: z.number().int().nonnegative(),
+    critical: z.number().int().nonnegative(),
+    high: z.number().int().nonnegative(),
+    medium: z.number().int().nonnegative(),
+    low: z.number().int().nonnegative(),
+    informational: z.number().int().nonnegative(),
+  }),
+});
 export const scanDto = z.object({
   id: z.string().min(1).max(128),
   target_url: z.string().url(),
@@ -65,6 +91,47 @@ export function normalizeScan(dto: ScanDto, results: Finding[] = []): ScanRecord
     reportFormats, canCancel: Boolean(dto.can_cancel) && (status === 'Pending' || status === 'Running'),
   };
 }
+export function normalizeSynchronousScan(dto: z.infer<typeof synchronousScanDto>, startedAt: string, completedAt: string): ScanRecord {
+  const counts = emptyCounts();
+  counts.Critical = dto.summary.critical;
+  counts.High = dto.summary.high;
+  counts.Medium = dto.summary.medium;
+  counts.Low = dto.summary.low;
+  counts.Info = dto.summary.informational;
+  const results: Finding[] = dto.findings.map((finding, index) => ({
+    id: String(index),
+    title: finding.title,
+    severity: finding.severity === 'informational' ? 'Info' : cap(finding.severity),
+    affectedUrl: finding.affected_url,
+    description: finding.description,
+    evidence: finding.evidence,
+    remediation: finding.recommendation,
+    confidence: cap(finding.confidence) as Exclude<Finding['confidence'], undefined>,
+  }));
+  return {
+    id: dto.scan_id ?? null,
+    target: dto.target_url,
+    name: new URL(dto.target_url).hostname,
+    profile: 'Backend default',
+    status: statusMap[dto.status],
+    date: new Date(startedAt).toLocaleString('en-GB', { timeZone: 'UTC' }) + ' UTC',
+    duration: formatDuration(startedAt, completedAt),
+    findings: dto.summary.total_findings,
+    high: counts.Critical + counts.High,
+    demo: false,
+    createdAt: startedAt,
+    startedAt,
+    completedAt: dto.status === 'running' ? null : completedAt,
+    endpoints: dto.scanned_urls?.length ?? 0,
+    counts,
+    results,
+    ...(dto.scanned_urls ? { scannedUrls: dto.scanned_urls } : {}),
+    scanLimitReached: dto.scan_limit_reached ?? false,
+    ...(dto.error ? { error: dto.error } : {}),
+    reportFormats: [],
+    canCancel: dto.status === 'running' && Boolean(dto.scan_id),
+  };
+}
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
   if (!result.success) throw new ApiError('invalid_response');
@@ -100,6 +167,7 @@ export function createHttpScannerApi(options: HttpAdapterOptions): ScannerApi {
   const json = async (res: Response) => { try { return await res.json(); } catch { throw new ApiError('invalid_response'); } };
   const scanPath = (id: string) => `/api/scans/${encodeURIComponent(id)}`;
   const notFound = () => new ScanNotFoundError();
+  const waitForProgress = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
   const api: ScannerApi = {
     mode: 'live',
     capabilities: { settings: false, authorizedTargets: false },
@@ -118,12 +186,31 @@ export function createHttpScannerApi(options: HttpAdapterOptions): ScannerApi {
       const f = parse(findingsDto, await json(findingsRes));
       return normalizeScan(dto, (Array.isArray(f) ? f : f.items).map(normalizeFinding));
     },
-    async createScan(input) {
+    async waitForScan(scanId, startedAt = new Date().toISOString()) {
+      let dto: z.infer<typeof synchronousScanDto>;
+      do {
+        const progress = await request(scanPath(scanId), { timeoutMs: options.timeoutMs ?? 15000 });
+        dto = parse(synchronousScanDto, await json(progress));
+        if (dto.scan_id !== scanId) throw new ApiError('invalid_response');
+        if (dto.status === 'running') await waitForProgress(500);
+      } while (dto.status === 'running');
+      return normalizeSynchronousScan(dto, startedAt, new Date().toISOString());
+    },
+    async createScan(input, onStarted) {
       const valid = createScanSchema.parse(input);
-      const res = await request('/api/scans', { method: 'POST', body: { target_url: valid.target, name: valid.name || null, profile: valid.profile.toLowerCase(), ...(valid.authorized === true ? { authorization_confirmed: true } : {}) } });
-      const dto = parse(scanDto, await json(res));
-      // Preserve the backend's actual lifecycle, including synchronous completion or failure.
-      return normalizeScan(dto);
+      const startedAt = new Date().toISOString();
+      const res = await request('/api/scans', {
+        method: 'POST',
+        body: { target_url: valid.target },
+        timeoutMs: options.timeoutMs ?? 310000,
+      });
+      const dto = parse(synchronousScanDto, await json(res));
+      if (dto.scan_id) onStarted?.(dto.scan_id);
+      if (dto.status !== 'running') {
+        return normalizeSynchronousScan(dto, startedAt, new Date().toISOString());
+      }
+      if (!dto.scan_id) throw new ApiError('invalid_response');
+      return api.waitForScan(dto.scan_id, startedAt);
     },
     async exportReport(id, format: ReportFormat) {
       const res = await request(`${scanPath(id)}/report?format=${format}`, { timeoutMs: options.reportTimeoutMs ?? 60000, notFound: () => new ApiError('not_found', { status: 404, message: 'This report is not available. The scan may not be finished, or the backend has not generated it.' }) });
@@ -143,7 +230,8 @@ export function createHttpScannerApi(options: HttpAdapterOptions): ScannerApi {
     },
     async cancelScan(id) {
       const res = await request(`${scanPath(id)}/cancel`, { method: 'POST' });
-      return normalizeScan(parse(scanDto, await json(res)));
+      const dto = parse(synchronousScanDto, await json(res));
+      return normalizeSynchronousScan(dto, new Date().toISOString(), new Date().toISOString());
     },
   };
   return api;
@@ -151,5 +239,5 @@ export function createHttpScannerApi(options: HttpAdapterOptions): ScannerApi {
 
 export function createDisconnectedScannerApi(reason: string): ScannerApi {
   const fail = async (): Promise<never> => { throw new ApiError('disconnected', { message: `The WebSentinel backend is not configured. ${reason}` }); };
-  return { mode: 'disconnected', capabilities: { settings: false, authorizedTargets: false }, health: fail, listScans: fail, getScan: fail, createScan: fail, exportReport: fail, cancelScan: fail };
+  return { mode: 'disconnected', capabilities: { settings: false, authorizedTargets: false }, health: fail, listScans: fail, getScan: fail, createScan: fail, waitForScan: fail, exportReport: fail, cancelScan: fail };
 }

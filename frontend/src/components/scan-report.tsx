@@ -30,7 +30,7 @@ export function ScanSummary({ scan }: { scan: ScanRecord }) {
           <span className={`scan-status scan-status-${scan.status.toLowerCase()}`}>{scan.status}</span>
           <span><Clock aria-hidden="true" size={13} />{scan.date}</span>
           {scan.duration !== '—' && <span>Duration {scan.duration}</span>}
-          {scan.endpoints > 0 && <span>{scan.endpoints} endpoints discovered</span>}
+          {scan.endpoints > 0 && <span>{scan.endpoints} URLs scanned</span>}
         </p>
       </div>
       <div className="summary-grid">
@@ -38,6 +38,20 @@ export function ScanSummary({ scan }: { scan: ScanRecord }) {
         {severities.map(sev => <SummaryCard key={sev} icon={<Shield size={18} className={`severity-${sev.toLowerCase()}`} />} label={sev === 'Info' ? 'Informational' : sev} value={scan.counts[sev]} />)}
       </div>
     </section>
+  );
+}
+
+export function ScannedPaths({ scan }: { scan: ScanRecord }) {
+  if (!scan.scannedUrls?.length) return null;
+  return (
+    <details className="technical-details">
+      <summary>Scanned paths ({scan.scannedUrls.length})</summary>
+      <ul className="related-endpoints">
+        {scan.scannedUrls.map(url => (
+          <li key={url} className="scanner-endpoint">{redactEvidence(url)}</li>
+        ))}
+      </ul>
+    </details>
   );
 }
 
@@ -139,7 +153,7 @@ export function TechnicalDetails({ scan }: { scan: ScanRecord }) {
     <details className="technical-details">
       <summary>Technical details</summary>
       <dl>
-        <div><dt>Scan ID</dt><dd className="scanner-endpoint">{scan.id}</dd></div>
+        {scan.id && <div><dt>Scan ID</dt><dd className="scanner-endpoint">{scan.id}</dd></div>}
         <div><dt>Profile</dt><dd>{scan.profile}</dd></div>
         <div><dt>Created</dt><dd>{scan.createdAt}</dd></div>
         {scan.startedAt && <div><dt>Started</dt><dd>{scan.startedAt}</dd></div>}

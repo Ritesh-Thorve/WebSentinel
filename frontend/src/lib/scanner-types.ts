@@ -14,12 +14,12 @@ export type Finding = { id: string; title?: string; severity?: Severity; categor
 export type SeverityCounts = Record<Severity, number>;
 export type ReportFormat = 'json' | 'html';
 export type ScanRecord = {
-  id: string; target: string; name: string; profile: string; status: ScanStatus;
+  id: string | null; target: string; name: string; profile: string; status: ScanStatus;
   date: string; duration: string; findings: number; high: number;
   /** true only for mock-adapter records; live records come from the backend database. */
   demo: boolean;
   createdAt: string; startedAt: string | null; completedAt: string | null;
-  endpoints: number; counts: SeverityCounts; results: Finding[]; scope?: string; error?: string;
+  endpoints: number; counts: SeverityCounts; results: Finding[]; scannedUrls?: string[]; scanLimitReached?: boolean; scope?: string; error?: string;
   /** Formats the backend reports as downloadable for this scan. Empty means unavailable. */
   reportFormats: ReportFormat[];
   /** Backend-declared: cancel endpoint exists and this scan can be cancelled. */
@@ -33,7 +33,8 @@ export interface ScannerApi {
   health(): Promise<HealthStatus>;
   listScans(): Promise<ScanRecord[]>;
   getScan(id: string): Promise<ScanRecord>;
-  createScan(input: CreateScanInput): Promise<ScanRecord>;
+  createScan(input: CreateScanInput, onStarted?: (scanId: string) => void): Promise<ScanRecord>;
+  waitForScan(scanId: string, startedAt?: string): Promise<ScanRecord>;
   exportReport(id: string, format: ReportFormat): Promise<Report>;
   cancelScan(id: string): Promise<ScanRecord>;
 }
@@ -45,4 +46,12 @@ export function formatDuration(start: string | null, end: string | null): string
   if (!Number.isFinite(ms) || ms < 0) return '—';
   const s = Math.round(ms / 1000);
   return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+}
+export function formatElapsedTime(elapsedSeconds: number): string {
+  const totalSeconds = Math.max(0, Math.floor(elapsedSeconds));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor(totalSeconds / 60) % 60;
+  const seconds = totalSeconds % 60;
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return hours > 0 ? `${pad(hours)}:${pad(minutes)}:${pad(seconds)}` : `${pad(Math.floor(totalSeconds / 60))}:${pad(seconds)}`;
 }

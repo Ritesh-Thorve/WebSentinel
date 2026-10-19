@@ -1,12 +1,12 @@
 """Main FastAPI application module for WebSentinel."""
 
 from contextlib import asynccontextmanager
-import os
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import settings
 from app.api.scans import router as scans_router
 from app.schemas import HealthResponse
 
@@ -24,15 +24,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
-allowed_origins = [origin.strip() for origin in frontend_origin.split(",") if origin.strip()]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=list(settings.frontend_origins),
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Accept", "Authorization", "Content-Type"],
 )
 
 app.include_router(scans_router)

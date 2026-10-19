@@ -1,5 +1,5 @@
 """WebSentinel application package."""
 
-from dotenv import load_dotenv
+from .config import settings
 
-load_dotenv()
+__all__ = ["settings"]

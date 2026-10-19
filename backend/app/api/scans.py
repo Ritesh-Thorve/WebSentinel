@@ -4,6 +4,8 @@ import asyncio
 import ipaddress
 import logging
 import socket
+from dataclasses import dataclass
+from uuid import uuid4
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException, status
@@ -12,14 +14,27 @@ from app.scanner.crawler import (
     BLOCKED_HOSTNAMES,
     BLOCKED_SUFFIXES,
     SSRFError,
+    TargetUnavailableError,
     is_blocked_ip,
 )
 from app.scanner.engine import scan_target
-from app.schemas import Finding, ScanRequest, ScanResponse, ScanSummary
+from app.schemas import ScanRequest, ScanResponse
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["scans"])
+
+
+@dataclass
+class ScanJob:
+    scan_id: str
+    target_url: str
+    cancel_event: asyncio.Event
+    response: ScanResponse
+    task: asyncio.Task[None] | None = None
+
+
+scan_jobs: dict[str, ScanJob] = {}
 
 
 def validate_target_url(target_url: str) -> str:
@@ -122,91 +137,103 @@ def validate_target_url(target_url: str) -> str:
     return trimmed
 
 
-def _compute_summary(findings: list[Finding]) -> ScanSummary:
-    """Calculate summary statistics grouped by severity level."""
-    counts = {
-        "critical": 0,
-        "high": 0,
-        "medium": 0,
-        "low": 0,
-        "informational": 0,
-    }
-    for finding in findings:
-        sev = getattr(finding, "severity", None)
-        if isinstance(finding, dict):
-            sev = finding.get("severity")
-        if sev in counts:
-            counts[sev] += 1
-
-    return ScanSummary(
-        total_findings=len(findings),
-        critical=counts["critical"],
-        high=counts["high"],
-        medium=counts["medium"],
-        low=counts["low"],
-        informational=counts["informational"],
-    )
+async def _execute_scan_job(job: ScanJob) -> None:
+    try:
+        result = await scan_target(job.target_url, cancel_event=job.cancel_event)
+        result.scan_id = job.scan_id
+        job.response = result
+    except SSRFError as exc:
+        job.response = ScanResponse(
+            scan_id=job.scan_id,
+            target_url=job.target_url,
+            status="failed",
+            error=str(exc) or "The target resolves to a restricted address.",
+        )
+    except TargetUnavailableError as exc:
+        job.response = ScanResponse(
+            scan_id=job.scan_id,
+            target_url=job.target_url,
+            status="failed",
+            error="The target could not be reached, so its security checks could not be completed.",
+        )
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        job.response = ScanResponse(
+            scan_id=job.scan_id,
+            target_url=job.target_url,
+            status="failed",
+            error=f"Scan timed out before completion: {exc}",
+        )
+    except ValueError as exc:
+        job.response = ScanResponse(
+            scan_id=job.scan_id,
+            target_url=job.target_url,
+            status="failed",
+            error=str(exc) or "Invalid target URL",
+        )
+    except Exception as exc:
+        logger.error("Scan execution failed due to an unexpected error: %s", type(exc).__name__)
+        job.response = ScanResponse(
+            scan_id=job.scan_id,
+            target_url=job.target_url,
+            status="failed",
+            error="An unexpected error occurred while processing the scan.",
+        )
 
 
 @router.post(
     "/api/scans",
     response_model=ScanResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Initiate security scan",
-    description="Scan a target URL for security vulnerabilities and misconfigurations.",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Start security scan",
+    description="Start a scan and return an identifier for progress and cancellation.",
 )
 @router.post(
     "/scans",
     response_model=ScanResponse,
-    status_code=status.HTTP_200_OK,
+    status_code=status.HTTP_202_ACCEPTED,
     include_in_schema=False,
 )
 async def create_scan(request: ScanRequest) -> ScanResponse:
-    """Validate target URL and run security inspection asynchronously."""
+    """Validate the target and start a cancellable background scan."""
     validated_url = validate_target_url(request.target_url)
-
-    try:
-        scan_result = await scan_target(validated_url)
-    except HTTPException:
-        raise
-    except SSRFError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc) or "Blocked destination: access to private or restricted targets is not allowed",
-        ) from exc
-    except (asyncio.TimeoutError, TimeoutError) as exc:
-        raise HTTPException(
-            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-            detail=f"Scan timed out before completion: {exc}",
-        ) from exc
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc) or "Invalid target URL",
-        ) from exc
-    except Exception as exc:
-        logger.error("Scan execution failed due to an unexpected error: %s", type(exc).__name__)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An unexpected error occurred while processing the scan.",
-        ) from None
-
-    if isinstance(scan_result, ScanResponse):
-        return scan_result
-
-    findings: list[Finding] = []
-    if isinstance(scan_result, list):
-        findings = [
-            f if isinstance(f, Finding) else Finding.model_validate(f)
-            for f in scan_result
-        ]
-    elif isinstance(scan_result, dict):
-        return ScanResponse.model_validate(scan_result)
-
-    summary = _compute_summary(findings)
-    return ScanResponse(
+    scan_id = uuid4().hex
+    job = ScanJob(
+        scan_id=scan_id,
         target_url=validated_url,
-        status="completed",
-        findings=findings,
-        summary=summary,
+        cancel_event=asyncio.Event(),
+        response=ScanResponse(
+            scan_id=scan_id,
+            target_url=validated_url,
+            status="running",
+        ),
     )
+    scan_jobs[scan_id] = job
+    job.task = asyncio.create_task(_execute_scan_job(job))
+    return job.response
+
+
+@router.get(
+    "/api/scans/{scan_id}",
+    response_model=ScanResponse,
+    summary="Get scan progress and results",
+)
+async def get_scan(scan_id: str) -> ScanResponse:
+    job = scan_jobs.get(scan_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+    return job.response
+
+
+@router.post(
+    "/api/scans/{scan_id}/cancel",
+    response_model=ScanResponse,
+    summary="Stop a scan and return partial results",
+)
+async def cancel_scan(scan_id: str) -> ScanResponse:
+    job = scan_jobs.get(scan_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Scan not found")
+    if job.task is not None and not job.task.done():
+        job.cancel_event.set()
+        await job.task
+    return job.response

@@ -73,7 +73,16 @@ export function statusToError(status: number, body: unknown, retryAfter: string 
   if (status === 403) return new ApiError('forbidden', { status });
   if (status === 404) return new ApiError('not_found', { status });
   if (status === 405 || status === 501) return new ApiError('not_implemented', { status });
-  if (status === 422 || status === 400) return new ApiError('validation', { status, fieldErrors: parseValidationDetail(body) });
+  if (status === 400) {
+    return new ApiError('validation', {
+      status,
+      message: 'The backend blocked this target because it points to a local, private, or otherwise restricted address. Use a publicly reachable website that you own or have permission to test.',
+      fieldErrors: parseValidationDetail(body),
+    });
+  }
+  if (status === 422) return new ApiError('validation', { status, fieldErrors: parseValidationDetail(body) });
+  if (status === 502) return new ApiError('server', { status, message: 'The backend could not reach the target, so the scan did not complete. Check that the website is publicly accessible and try again.' });
+  if (status === 504) return new ApiError('timeout', { status });
   if (status === 429) { const seconds = retryAfter ? Number(retryAfter) : NaN; return new ApiError('rate_limited', { status, ...(Number.isFinite(seconds) ? { retryAfterSeconds: seconds, message: `Too many requests. Try again in about ${Math.ceil(seconds)} seconds.` } : {}) }); }
   if (status >= 500) return new ApiError('server', { status });
   return new ApiError('unknown', { status });

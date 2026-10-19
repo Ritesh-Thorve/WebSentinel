@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
-import { CategoryBreakdown, FindingsList, ScanSummary, SeverityDistribution, TechnicalDetails } from '@/components/scan-report';
+import { CategoryBreakdown, FindingsList, ScanSummary, ScannedPaths, SeverityDistribution, TechnicalDetails } from '@/components/scan-report';
 import { emptyCounts, type ScanRecord } from '@/lib/scanner-api';
 
 const counts = { ...emptyCounts(), Critical: 1, High: 1, Medium: 1 };
@@ -8,7 +8,7 @@ const scan: ScanRecord = {
   id: 'scan-123', target: 'https://app.example.com', name: 'app.example.com', profile: 'Standard',
   status: 'Completed', date: '19/10/2026, 06:00:00 UTC', duration: '1m 05s', findings: 3, high: 2, demo: false,
   createdAt: '2026-10-19T06:00:00Z', startedAt: '2026-10-19T06:00:00Z', completedAt: '2026-10-19T06:01:05Z',
-  endpoints: 12, counts, scope: 'https://app.example.com/*', reportFormats: [], canCancel: false,
+  endpoints: 12, counts, scope: 'https://app.example.com/*', scannedUrls: ['https://app.example.com/', 'https://app.example.com/about'], scanLimitReached: false, reportFormats: [], canCancel: false,
   results: [
     { id: 'f1', title: 'Missing Content-Security-Policy header', severity: 'Medium', confidence: 'High', verification: 'Potential', category: 'Security Headers', affectedUrl: 'https://app.example.com/', description: 'The response did not include a CSP header.', evidence: 'GET / HTTP/1.1\nauthorization: Bearer secret-token-123', remediation: 'Add a Content-Security-Policy header.' },
     { id: 'f2', title: 'Reflected marker observed', severity: 'High', confidence: 'Low', verification: 'Potential', category: 'Input Reflection', affectedUrl: 'https://app.example.com/search?q=ws7', description: 'A marker was reflected in the response body.' },
@@ -23,7 +23,15 @@ describe('ScanSummary', () => {
     expect(screen.getByText('Completed')).toBeTruthy();
     expect(screen.getByText('Total findings')).toBeTruthy();
     expect(screen.getByText('3')).toBeTruthy();
-    expect(screen.getByText('12 endpoints discovered')).toBeTruthy();
+    expect(screen.getByText('12 URLs scanned')).toBeTruthy();
+  });
+});
+
+describe('ScannedPaths', () => {
+  it('lists the same-origin paths returned by the backend', () => {
+    render(<ScannedPaths scan={scan} />);
+    expect(screen.getByText('Scanned paths (2)')).toBeTruthy();
+    expect(screen.getByText('https://app.example.com/about')).toBeTruthy();
   });
 });
 

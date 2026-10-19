@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -12,6 +11,7 @@ from pydantic import ValidationError
 
 try:
     from app.schemas import Finding, ScanResponse, ScanSummary
+    from app.config import settings
     from app.scanner.crawler import (
         DEFAULT_MAX_BODY_BYTES,
         DEFAULT_MAX_PAGES,
@@ -29,6 +29,7 @@ try:
     from app.scanner.reflection import check_reflection
 except ImportError:
     from ..schemas import Finding, ScanResponse, ScanSummary  # type: ignore[no-redef]
+    from ..config import settings  # type: ignore[no-redef]
     from .crawler import (  # type: ignore[no-redef]
         DEFAULT_MAX_BODY_BYTES,
         DEFAULT_MAX_PAGES,
@@ -47,9 +48,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TOTAL_TIMEOUT = float(
-    os.getenv("WEBSENTINEL_TOTAL_TIMEOUT", os.getenv("WEBSENTINEL_SCAN_TIMEOUT", "60.0"))
-)
+DEFAULT_TOTAL_TIMEOUT = settings.total_scan_timeout
 
 
 def compute_summary(findings: list[Finding]) -> ScanSummary:
@@ -91,16 +90,19 @@ async def _execute_scan(
     max_requests: int,
     timeout: float,
     max_body_bytes: int,
+    cancel_event: asyncio.Event | None = None,
 ) -> ScanResponse:
     """Execute crawl and run all security check modules, merging findings safely."""
     # 1. Safely collect pages using same-origin crawler with SSRF protection
-    pages = await crawl_target(
+    crawl_result = await crawl_target(
         target_url=target_url,
         max_pages=max_pages,
         max_requests=max_requests,
         timeout=timeout,
         max_body_bytes=max_body_bytes,
+        cancel_event=cancel_event,
     )
+    pages = crawl_result.pages
 
     # 2. Pass collected page records to check modules
     checker_modules = (
@@ -112,6 +114,7 @@ async def _execute_scan(
     )
 
     raw_findings: list[Finding] = []
+    failed_modules: list[str] = []
 
     for module_name, checker_func in checker_modules:
         try:
@@ -122,6 +125,7 @@ async def _execute_scan(
                     module_name,
                     type(results).__name__,
                 )
+                failed_modules.append(module_name)
                 continue
 
             for item in results:
@@ -136,18 +140,25 @@ async def _execute_scan(
                             module_name,
                             type(item).__name__,
                         )
+                        failed_modules.append(module_name)
                 except ValidationError as val_err:
                     logger.warning(
                         "Validation error in finding from module '%s': %s",
                         module_name,
                         type(val_err).__name__,
                     )
+                    failed_modules.append(module_name)
         except Exception as exc:
-            logger.warning(
+            logger.exception(
                 "Check module '%s' failed during scan: %s",
                 module_name,
                 type(exc).__name__,
             )
+            failed_modules.append(module_name)
+
+    if failed_modules:
+        failed_names = ", ".join(dict.fromkeys(failed_modules))
+        raise RuntimeError(f"Security check modules failed: {failed_names}")
 
     # 3. Deduplicate equivalent findings using a stable key
     deduplicated_findings: list[Finding] = []
@@ -170,9 +181,17 @@ async def _execute_scan(
     # 5. Return completed ScanResponse
     return ScanResponse(
         target_url=target_url,
-        status="completed",
+        status="cancelled" if crawl_result.cancelled else "completed",
         findings=deduplicated_findings,
         summary=summary,
+        scanned_urls=list(
+            dict.fromkeys(
+                sanitize_url_for_logging(page["url"])
+                for page in pages
+                if isinstance(page.get("url"), str)
+            )
+        ),
+        scan_limit_reached=crawl_result.limit_reached,
     )
 
 
@@ -183,6 +202,7 @@ async def scan_target(
     timeout: float | None = None,
     max_body_bytes: int | None = None,
     total_timeout: float | None = None,
+    cancel_event: asyncio.Event | None = None,
 ) -> ScanResponse:
     """Orchestrate security scan on target URL.
 
@@ -241,6 +261,7 @@ async def scan_target(
                 max_requests=eff_max_requests,
                 timeout=eff_timeout,
                 max_body_bytes=eff_max_body_bytes,
+                cancel_event=cancel_event,
             ),
             timeout=eff_total_timeout,
         )

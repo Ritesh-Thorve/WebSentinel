@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from dataclasses import dataclass
 import ipaddress
 import logging
-import os
+import re
 import socket
-import ssl
+import xml.etree.ElementTree as ET
 from typing import Any
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -25,13 +26,15 @@ except ImportError:
 
 import httpx
 
+from app.config import MAX_SCAN_REQUESTS, settings
+
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_PAGES = int(os.getenv("WEBSENTINEL_MAX_PAGES", "10"))
-DEFAULT_MAX_REQUESTS = int(os.getenv("WEBSENTINEL_MAX_REQUESTS", "15"))
-DEFAULT_TIMEOUT = float(os.getenv("WEBSENTINEL_TIMEOUT", "10.0"))
-DEFAULT_MAX_BODY_BYTES = int(os.getenv("WEBSENTINEL_MAX_BODY_BYTES", "1000000"))
-DEFAULT_MAX_REDIRECTS = int(os.getenv("WEBSENTINEL_MAX_REDIRECTS", "5"))
+DEFAULT_MAX_PAGES = settings.max_pages
+DEFAULT_MAX_REQUESTS = settings.max_requests
+DEFAULT_TIMEOUT = settings.request_timeout
+DEFAULT_MAX_BODY_BYTES = settings.max_body_bytes
+DEFAULT_MAX_REDIRECTS = settings.max_redirects
 
 BLOCKED_HOSTNAMES = {
     "localhost",
@@ -50,16 +53,43 @@ BLOCKED_SUFFIXES = (
     ".lan",
     ".home.arpa",
 )
+NAT64_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+JAVASCRIPT_PATH_PATTERN = re.compile(
+    r"""(?P<quote>["'`])(?P<path>(?:https?:)?//[^"'`\s<>]+|(?:/|\./|\.\./)[^"'`\s<>]*)(?P=quote)""",
+    re.IGNORECASE,
+)
 
 
 class SSRFError(ValueError):
     """Exception raised when an endpoint targets a private, internal, or restricted destination."""
 
 
+class TargetUnavailableError(RuntimeError):
+    """Exception raised when the submitted target returns no fetchable same-origin pages."""
+
+
+@dataclass(frozen=True)
+class CrawlResult:
+    pages: list[dict[str, Any]]
+    limit_reached: bool
+    cancelled: bool = False
+
+
+@dataclass(frozen=True)
+class BrowserDiscoveryResult:
+    urls: list[str]
+    request_headers: dict[str, dict[str, str]]
+    cookies: list[dict[str, Any]]
+    requests_used: int
+    limit_reached: bool
+
+
 def is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Determine whether an IP address belongs to a private, loopback, or restricted space."""
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
         ip = ip.ipv4_mapped
+    elif isinstance(ip, ipaddress.IPv6Address) and ip in NAT64_PREFIX:
+        ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
     if not ip.is_global:
         return True
     return (
@@ -281,6 +311,8 @@ def sanitize_url_for_logging(url: str) -> str:
     try:
         parsed = urlsplit(url)
         host = (parsed.hostname or "").lower()
+        if ":" in host:
+            host = f"[{host}]"
         if parsed.port:
             netloc = f"{host}:{parsed.port}"
         else:
@@ -292,7 +324,7 @@ def sanitize_url_for_logging(url: str) -> str:
 
 
 def extract_html_links(html_text: str, base_url: str) -> list[str]:
-    """Extract and resolve navigable same-origin candidate URLs using BeautifulSoup."""
+    """Extract page links and same-origin JavaScript resources using BeautifulSoup."""
     if not html_text:
         return []
 
@@ -302,14 +334,16 @@ def extract_html_links(html_text: str, base_url: str) -> list[str]:
         return []
 
     links: list[str] = []
-    for tag in soup.find_all("a", href=True):
-        href = tag.get("href")
-        if not href or not isinstance(href, str):
+    tag_attributes = [(tag, "href") for tag in soup.find_all("a", href=True)]
+    tag_attributes.extend((tag, "src") for tag in soup.find_all("script", src=True))
+    for tag, attribute in tag_attributes:
+        value = tag.get(attribute)
+        if not value or not isinstance(value, str):
             continue
-        cleaned = href.strip()
-        if not cleaned:
-            continue
-        if cleaned.startswith(("#", "javascript:", "mailto:", "tel:", "data:", "sms:", "callto:")):
+        cleaned = value.strip()
+        if not cleaned or cleaned.startswith(
+            ("#", "javascript:", "mailto:", "tel:", "data:", "sms:", "callto:")
+        ):
             continue
 
         try:
@@ -323,12 +357,64 @@ def extract_html_links(html_text: str, base_url: str) -> list[str]:
     return links
 
 
+def extract_javascript_links(javascript: str, base_url: str) -> list[str]:
+    """Extract static URL and route references from JavaScript source."""
+    links: list[str] = []
+    for match in JAVASCRIPT_PATH_PATTERN.finditer(javascript):
+        path = match.group("path")
+        if "${" in path or any(character in path for character in "[]()*|\\$"):
+            continue
+        try:
+            absolute = urljoin(base_url, path)
+            parsed = urlsplit(absolute)
+            has_parameter_segment = any(
+                segment.startswith(":") for segment in parsed.path.split("/")
+            )
+            if (
+                parsed.scheme.lower() in {"http", "https"}
+                and parsed.hostname
+                and not has_parameter_segment
+            ):
+                links.append(absolute)
+        except Exception:
+            continue
+    return links
+
+
+def extract_sitemap_links(xml_text: str, base_url: str) -> list[str]:
+    """Extract sitemap URL locations, including child sitemap locations."""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+
+    links: list[str] = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1].lower() != "loc" or not element.text:
+            continue
+        candidate = element.text.strip()
+        if candidate:
+            links.append(urljoin(base_url, candidate))
+    return links
+
+
+def extract_robots_sitemaps(robots_text: str, base_url: str) -> list[str]:
+    """Extract sitemap locations advertised in robots.txt."""
+    links: list[str] = []
+    for line in robots_text.splitlines():
+        name, separator, value = line.partition(":")
+        if separator and name.strip().lower() == "sitemap" and value.strip():
+            links.append(urljoin(base_url, value.strip()))
+    return links
+
+
 async def fetch_page(
     client: httpx.AsyncClient,
     url: str,
     base_origin: tuple[str, str, int],
     max_body_bytes: int,
     max_redirects: int,
+    request_headers: dict[str, str] | None = None,
 ) -> tuple[dict[str, Any] | None, int, tuple[str, str, int]]:
     """
     Fetch a single URL following same-origin redirects with SSRF/DNS rebinding validation.
@@ -354,7 +440,13 @@ async def fetch_page(
         redirect_chain.append(current_url)
 
         try:
-            req = client.build_request("GET", current_url)
+            safe_headers = {
+                name: value
+                for name, value in (request_headers or {}).items()
+                if name.lower()
+                in {"authorization", "cookie", "x-api-key", "x-csrf-token", "x-xsrf-token"}
+            }
+            req = client.build_request("GET", current_url, headers=safe_headers or None)
             response = await client.send(req, stream=True)
         except SSRFError:
             raise
@@ -456,13 +548,221 @@ async def fetch_page(
         }, requests_made, base_origin
 
 
+async def discover_browser_routes(
+    target_url: str,
+    base_origin: tuple[str, str, int],
+    max_pages: int,
+    max_requests: int,
+    timeout: float,
+    cancel_event: asyncio.Event | None = None,
+) -> BrowserDiscoveryResult:
+    """Render same-origin pages to discover JavaScript-generated routes and session state."""
+    from playwright.async_api import Error as PlaywrightError
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.async_api import async_playwright
+
+    from app.browser_session import chromium_executable, storage_state_path
+
+    state_path = storage_state_path(target_url)
+    if not state_path.exists():
+        logger.info("No saved browser session for target origin; scanning public routes.")
+
+    host = urlsplit(target_url).hostname
+    if not host:
+        raise ValueError("Target hostname cannot be empty")
+    try:
+        target_ip = ipaddress.ip_address(host)
+    except ValueError:
+        target_ip = None
+    if target_ip is not None:
+        if is_blocked_ip(target_ip):
+            raise SSRFError(f"Blocked destination: access to restricted IP '{host}' is not allowed")
+        host_resolver_rule = None
+    else:
+        ascii_host = host.encode("idna").decode("ascii").lower().rstrip(".")
+        if not re.fullmatch(r"[a-z0-9.-]+", ascii_host):
+            raise ValueError("Target hostname contains characters unsafe for browser resolution")
+        try:
+            address_infos = socket.getaddrinfo(
+                ascii_host,
+                base_origin[2],
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            raise SSRFError(f"Could not safely resolve target hostname '{host}'") from exc
+        resolved_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+        for address_info in address_infos:
+            try:
+                resolved_address = ipaddress.ip_address(address_info[4][0])
+            except ValueError as exc:
+                raise SSRFError(f"Target hostname '{host}' resolved to an invalid IP") from exc
+            if is_blocked_ip(resolved_address):
+                raise SSRFError(
+                    f"Blocked destination: target '{host}' resolved to restricted IP "
+                    f"'{resolved_address}'"
+                )
+            if resolved_address not in resolved_addresses:
+                resolved_addresses.append(resolved_address)
+        if not resolved_addresses:
+            raise SSRFError(f"Target hostname '{host}' has no public address records")
+        selected_address = resolved_addresses[0]
+        address_text = (
+            f"[{selected_address}]" if isinstance(selected_address, ipaddress.IPv6Address)
+            else str(selected_address)
+        )
+        host_resolver_rule = (
+            f"--host-resolver-rules=MAP {ascii_host} {address_text}"
+        )
+
+    browser_urls: set[str] = set()
+    request_headers: dict[str, dict[str, str]] = {}
+    queued_urls: set[str] = set()
+    queue: deque[str] = deque([normalize_url(target_url)])
+    request_count = 0
+    budget_reached = False
+    current_url = normalize_url(target_url)
+    origin_url = f"{base_origin[0]}://{base_origin[1]}"
+
+    async with async_playwright() as playwright:
+        launch_options: dict[str, Any] = {"headless": True}
+        executable = chromium_executable()
+        if executable:
+            launch_options["executable_path"] = executable
+        if host_resolver_rule:
+            launch_options["args"] = [host_resolver_rule]
+        browser = await playwright.chromium.launch(**launch_options)
+        context = None
+        cookies: list[dict[str, Any]] = []
+        try:
+            context_options: dict[str, Any] = {}
+            if state_path.exists():
+                context_options["storage_state"] = str(state_path)
+            context_options["service_workers"] = "block"
+            context = await browser.new_context(**context_options)
+            page = await context.new_page()
+
+            async def block_websocket(websocket: Any) -> None:
+                await websocket.close()
+
+            async def guard_request(route: Any) -> None:
+                nonlocal request_count, budget_reached
+                request = route.request
+                if request_count >= max_requests:
+                    budget_reached = True
+                    await route.abort()
+                    return
+                request_count += 1
+                if request.method not in {"GET", "HEAD"} or not is_same_origin(request.url, base_origin):
+                    await route.abort()
+                    return
+                try:
+                    validate_url_safety(request.url)
+                except ValueError:
+                    await route.abort()
+                    return
+                safe_headers = {
+                    name: value
+                    for name, value in (await request.all_headers()).items()
+                    if name.lower()
+                    in {"authorization", "cookie", "x-api-key", "x-csrf-token", "x-xsrf-token"}
+                }
+                request_headers[normalize_url(request.url)] = safe_headers
+                browser_urls.add(normalize_url(request.url))
+                await route.continue_()
+
+            await context.route("**/*", guard_request)
+            await context.route_web_socket("**/*", block_websocket)
+
+            def enqueue(candidates: list[str]) -> None:
+                for candidate in candidates:
+                    clean_url = normalize_url(candidate)
+                    if (
+                        is_same_origin(clean_url, base_origin)
+                        and clean_url not in browser_urls
+                        and clean_url not in queued_urls
+                        and len(queued_urls) < max_pages
+                    ):
+                        queue.append(clean_url)
+                        queued_urls.add(clean_url)
+
+            while (
+                queue
+                and len(browser_urls) < max_pages
+                and request_count < max_requests
+                and not (cancel_event and cancel_event.is_set())
+            ):
+                current_url = queue.popleft()
+                if current_url in browser_urls:
+                    continue
+                try:
+                    await page.goto(
+                        current_url,
+                        wait_until="domcontentloaded",
+                        timeout=max(1000, int(timeout * 1000)),
+                    )
+                    try:
+                        await page.wait_for_load_state(
+                            "networkidle",
+                            timeout=min(2000, max(500, int(timeout * 1000))),
+                        )
+                    except PlaywrightTimeoutError:
+                        logger.debug(
+                            "Dynamic page remained active: %s",
+                            sanitize_url_for_logging(current_url),
+                        )
+                    discovered = await page.locator(
+                        "a[href], area[href], form[action], iframe[src]"
+                    ).evaluate_all(
+                        """elements => elements.flatMap(element => {
+                          const tag = element.tagName.toLowerCase();
+                          if (tag === 'form' && (element.method || 'get').toLowerCase() !== 'get') return [];
+                          return [tag === 'form' ? element.action : element.href || element.src];
+                        })"""
+                    )
+                except PlaywrightTimeoutError:
+                    logger.warning(
+                        "Browser discovery timed out for %s",
+                        sanitize_url_for_logging(current_url),
+                    )
+                    continue
+                except PlaywrightError as exc:
+                    logger.warning(
+                        "Browser discovery failed for %s: %s",
+                        sanitize_url_for_logging(current_url),
+                        type(exc).__name__,
+                    )
+                    continue
+                enqueue([url for url in discovered if isinstance(url, str)])
+                if budget_reached:
+                    break
+            if queue and (
+                request_count >= max_requests or len(browser_urls) >= max_pages
+            ):
+                budget_reached = True
+        finally:
+            try:
+                if context is not None:
+                    cookies = await context.cookies(origin_url)
+            finally:
+                await browser.close()
+
+    return BrowserDiscoveryResult(
+        urls=sorted(browser_urls),
+        request_headers=request_headers,
+        cookies=cookies,
+        requests_used=request_count,
+        limit_reached=budget_reached,
+    )
+
+
 async def crawl_target(
     target_url: str,
     max_pages: int = DEFAULT_MAX_PAGES,
     max_requests: int = DEFAULT_MAX_REQUESTS,
     timeout: float = DEFAULT_TIMEOUT,
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES,
-) -> list[dict[str, Any]]:
+    cancel_event: asyncio.Event | None = None,
+) -> CrawlResult:
     """
     Asynchronously crawl target_url on the same origin.
 
@@ -474,8 +774,7 @@ async def crawl_target(
         max_body_bytes: Maximum response body size in bytes to buffer.
 
     Returns:
-        List of crawled page records with url, status_code, headers, body,
-        set_cookie_headers, and content_type.
+        CrawlResult with fetched page records and whether a crawl limit was reached.
     """
     if not isinstance(target_url, str):
         raise ValueError("Target URL must be a string")
@@ -493,26 +792,95 @@ async def crawl_target(
         raise ValueError("Target port must be between 1 and 65535")
 
     validate_url_safety(trimmed_target)
+    max_pages = min(max(1, max_pages), MAX_SCAN_REQUESTS)
+    max_requests = min(max(1, max_requests), MAX_SCAN_REQUESTS)
 
     base_origin = get_origin(trimmed_target)
     start_url = normalize_url(trimmed_target)
+    browser_result = await discover_browser_routes(
+        target_url=trimmed_target,
+        base_origin=base_origin,
+        max_pages=max_pages,
+        max_requests=max_requests // 2,
+        timeout=timeout,
+        cancel_event=cancel_event,
+    )
 
     queue: deque[str] = deque([start_url])
+    queued_urls = {start_url}
     visited_urls: set[str] = set()
     results: list[dict[str, Any]] = []
-    total_requests = 0
+    total_requests = browser_result.requests_used
+    crawl_limit_reached = browser_result.limit_reached
+
+    def enqueue_browser_urls() -> None:
+        nonlocal crawl_limit_reached
+        for candidate in browser_result.urls:
+            clean_candidate = normalize_url(candidate)
+            if (
+                is_same_origin(clean_candidate, base_origin)
+                and clean_candidate not in visited_urls
+                and clean_candidate not in queued_urls
+            ):
+                if total_requests + len(queue) >= max_requests:
+                    crawl_limit_reached = True
+                    return
+                queue.append(clean_candidate)
+                queued_urls.add(clean_candidate)
+
+    def enqueue_candidates(candidates: list[str]) -> None:
+        nonlocal crawl_limit_reached
+        for candidate in candidates:
+            clean_candidate = normalize_url(candidate)
+            if (
+                is_same_origin(clean_candidate, base_origin)
+                and clean_candidate not in visited_urls
+                and clean_candidate not in queued_urls
+            ):
+                if total_requests + len(queue) >= max_requests:
+                    crawl_limit_reached = True
+                    break
+                queue.append(clean_candidate)
+                queued_urls.add(clean_candidate)
 
     limits = httpx.Limits(max_connections=10, max_keepalive_connections=5)
     timeout_cfg = httpx.Timeout(timeout=timeout, connect=min(5.0, timeout))
     transport = SafeTransport(verify=True, limits=limits)
+    cancelled_fetch_attempted = False
+    browser_cookies = httpx.Cookies()
+    for cookie in browser_result.cookies:
+        if isinstance(cookie.get("name"), str) and isinstance(cookie.get("value"), str):
+            browser_cookies.set(
+                cookie["name"],
+                cookie["value"],
+                domain=cookie.get("domain"),
+                path=cookie.get("path", "/"),
+            )
 
     async with httpx.AsyncClient(
         transport=transport,
         timeout=timeout_cfg,
         follow_redirects=False,
         headers={"User-Agent": "WebSentinel-Crawler/1.0"},
+        cookies=browser_cookies,
     ) as client:
-        while queue and len(results) < max_pages and total_requests < max_requests:
+        enqueue_browser_urls()
+        enqueue_candidates(
+            [
+                urljoin(start_url, "/robots.txt"),
+                urljoin(start_url, "/sitemap.xml"),
+            ]
+        )
+        while (
+            queue
+            and len(results) < max_pages
+            and total_requests < max_requests
+            and not (
+                cancel_event
+                and cancel_event.is_set()
+                and cancelled_fetch_attempted
+            )
+        ):
             url_to_crawl = queue.popleft()
             clean_url = normalize_url(url_to_crawl)
 
@@ -535,6 +903,7 @@ async def crawl_target(
                     base_origin=base_origin,
                     max_body_bytes=max_body_bytes,
                     max_redirects=max_hop_redirects,
+                    request_headers=browser_result.request_headers.get(clean_url),
                 )
             except SSRFError:
                 raise
@@ -547,22 +916,54 @@ async def crawl_target(
                 continue
 
             total_requests += reqs_used
+            if cancel_event and cancel_event.is_set():
+                cancelled_fetch_attempted = True
 
             if record is None:
                 continue
 
             results.append(record)
-            if len(results) >= max_pages:
+            if cancel_event and cancel_event.is_set():
                 break
 
             ct = record.get("content_type", "").lower()
-            body_preview = record.get("body", "")[:200].lower()
+            body = record.get("body", "")
+            body_preview = body[:200].lower()
+            current_path = urlsplit(record["url"]).path.lower()
+            candidates: list[str] = []
             if "text/html" in ct or "xhtml" in ct or (not ct and "<html" in body_preview):
-                found_links = extract_html_links(record["body"], record["url"])
-                for link in found_links:
-                    candidate_clean = normalize_url(link)
-                    if is_same_origin(candidate_clean, base_origin):
-                        if candidate_clean not in visited_urls and candidate_clean not in queue:
-                            queue.append(candidate_clean)
+                candidates.extend(extract_html_links(body, record["url"]))
+                soup = BeautifulSoup(body, "html.parser")
+                for script in soup.find_all("script"):
+                    if script.string:
+                        candidates.extend(extract_javascript_links(script.string, record["url"]))
+            if (
+                "javascript" in ct
+                or current_path.endswith((".js", ".mjs"))
+            ):
+                candidates.extend(extract_javascript_links(body, record["url"]))
+            if current_path.endswith("/robots.txt") or current_path == "robots.txt":
+                candidates.extend(extract_robots_sitemaps(body, record["url"]))
+            if (
+                "xml" in ct
+                or "sitemap" in current_path
+                or body.lstrip().lower().startswith(("<?xml", "<urlset", "<sitemapindex"))
+            ):
+                candidates.extend(extract_sitemap_links(body, record["url"]))
+            enqueue_candidates(candidates)
 
-    return results
+    if not results:
+        if cancel_event and cancel_event.is_set():
+            return CrawlResult(pages=[], limit_reached=False, cancelled=True)
+        raise TargetUnavailableError("No pages could be fetched from the supplied target.")
+    cancelled = bool(cancel_event and cancel_event.is_set())
+    return CrawlResult(
+        pages=results,
+        limit_reached=(
+            False
+            if cancelled
+            else crawl_limit_reached
+            or (bool(queue) and (len(results) >= max_pages or total_requests >= max_requests))
+        ),
+        cancelled=cancelled,
+    )
