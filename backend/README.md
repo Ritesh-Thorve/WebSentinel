@@ -15,10 +15,18 @@ Run these commands from the `backend/` directory:
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
 ```
 
-Edit `.env` as needed, then launch the API using its environment-configured host, port, and log level:
+Create a local `.env` file in `backend/` for development:
+
+```env
+HOST=127.0.0.1
+PORT=9000
+LOG_LEVEL=INFO
+FRONTEND_ORIGIN=http://localhost:5173,http://127.0.0.1:5173
+```
+
+Edit values as needed, then launch the API using its environment-configured host, port, and log level:
 
 ```bash
 python -m app
@@ -28,12 +36,12 @@ The sample configuration uses `0.0.0.0` so the service is reachable from a conta
 
 ## Environment configuration
 
-`app.config` reads the backend's `.env` file independent of the process working directory, and process environment variables take precedence. `.env` is ignored by Git; commit only `.env.example`. Invalid values fail at startup with a configuration error. Copy `.env.example` to start:
+`app.config` reads the backend's `.env` file independent of the process working directory, and process environment variables take precedence. Local `.env` files and optional `.env.example` templates are ignored by Git. Invalid values fail at startup with a configuration error.
 
 | Variable | Default | Purpose |
 |---|---:|---|
 | `HOST` | `0.0.0.0` | Uvicorn bind address. Use `127.0.0.1` for local-only access. |
-| `PORT` | `9000` (local fallback) | Uvicorn listen port. A hosting platform-provided `PORT` environment variable takes precedence; the value in `.env.example` is not used when the platform injects its own. |
+| `PORT` | `9000` (local fallback) | Uvicorn listen port. A hosting platform-provided `PORT` environment variable takes precedence. |
 | `LOG_LEVEL` | `INFO` | `CRITICAL`, `ERROR`, `WARNING`, `INFO`, or `DEBUG`. |
 | `FRONTEND_ORIGIN` | Required | Comma-separated exact frontend origins; configure local origins for development and your deployed frontend origin in production. No wildcard origins or paths. |
 | `WEBSENTINEL_MAX_PAGES` | `500` | Maximum page records per scan; hard maximum is 500. |

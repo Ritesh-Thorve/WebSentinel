@@ -6,11 +6,11 @@ Minimal scanner interface: enter a target URL, select **Scan Target**, and revie
 
 ```sh
 bun install
-cp .env.example .env.local
+printf 'VITE_API_BASE_URL=http://127.0.0.1:9000\n' > .env.local
 bun run dev
 ```
 
-`.env.local` starts with `VITE_API_BASE_URL=http://localhost:9000`. The frontend reads this with `import.meta.env.VITE_API_BASE_URL`; the scanner API client uses it as the base for its `/api/scans` create, poll, and cancel requests. If it is empty or invalid, the app stays disconnected and displays an error instead of using fake results. Restart Vite after changing the value.
+`.env.local` is a local-only file and is ignored by Git. The frontend reads `VITE_API_BASE_URL` with `import.meta.env.VITE_API_BASE_URL`; the scanner API client uses it as the base for its `/api/scans` create, poll, and cancel requests. If it is empty or invalid, the app stays disconnected and displays an error instead of using fake results. Restart Vite after changing the value.
 
 ## Deployment configuration
 
