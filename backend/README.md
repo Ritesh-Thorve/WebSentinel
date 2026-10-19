@@ -57,6 +57,8 @@ The scanner's SSRF defenses are intentionally not configurable: private, loopbac
 
 ## Frontend connection
 
+For a step-by-step Docker deployment guide, see [deploy.md](./deploy.md).
+
 Configure the backend's `FRONTEND_ORIGIN` with the exact scheme, host, and port of the frontend. For example:
 
 ```env
